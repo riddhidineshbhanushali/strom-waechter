@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "⚡ Run Strom-Wächter Dashboard",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "streamlit",
+            "args": [
+                "run",
+                "${workspaceFolder}/app.py"
+            ],
+            "jinja": true,
+            "justMyCode": true
+        },
+        {
+            "name": "🔄 Run Pipeline Update",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/pipeline.py",
+            "args": [
+                "--weeks",
+                "4"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}
