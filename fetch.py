@@ -63,7 +63,7 @@ class SMARDClient:
                         "SMARD HTTP %s on %s (attempt %d/%d)",
                         response.status_code, url, attempt, MAX_RETRIES
                     )
-            except (requests.RequestException, ValueError) as exc:
+            except Exception as exc:
                 logger.warning(
                     "SMARD request error on %s: %s (attempt %d/%d)",
                     url, exc, attempt, MAX_RETRIES

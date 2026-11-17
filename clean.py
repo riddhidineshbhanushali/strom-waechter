@@ -1,152 +1,180 @@
 """
-Data cleaning and harmonization module for Strom-Wächter.
-Handles timezones, Daylight Saving Time (23h / 25h days), unit conversions,
-and missing value imputation.
+Data cleaning, validation, and harmonization module for Strom-Wächter.
+Strictly handles UTC canonical timestamps, Europe/Berlin local time conversions,
+23-hour (Spring forward) and 25-hour (Fall back) DST transitions, bounds validation,
+and explicit missing-value handling without silently fabricating prices.
 """
 
-from __future__ import annotations
-from typing import Dict, List, Any, Optional
+from typing import List, Optional, Tuple, Dict, Any
+from datetime import datetime, timezone
+import zoneinfo
 import numpy as np
 import pandas as pd
 
+from config import TIMEZONE_BERLIN, TIMEZONE_UTC
 
-def raw_series_to_dataframe(
-    raw_series: List[List[Any]],
-    value_column: str
-) -> pd.DataFrame:
+BERLIN_TZ = zoneinfo.ZoneInfo(TIMEZONE_BERLIN)
+UTC_TZ = zoneinfo.ZoneInfo(TIMEZONE_UTC)
+
+# Physical and European market sanity boundaries
+# EPEX SPOT technical price limits are -500 EUR/MWh (-50 ct/kWh) to +4000 EUR/MWh (+400 ct/kWh)
+MIN_PRICE_EUR_MWH = -500.0
+MAX_PRICE_EUR_MWH = 4000.0
+MIN_PRICE_CT_KWH = MIN_PRICE_EUR_MWH / 10.0  # -50.0 ct/kWh
+MAX_PRICE_CT_KWH = MAX_PRICE_EUR_MWH / 10.0  # +400.0 ct/kWh
+
+
+def validate_and_clean_raw_records(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Converts SMARD raw series [[epoch_ms, value], ...] into a pandas DataFrame.
-    Filters out None/null values and handles duplicate timestamps.
+    Cleans raw fetched market observations:
+    - Deduplicates timestamps.
+    - Validates price and generation boundaries.
+    - Ensures UTC timestamp ordering.
     """
-    if not raw_series:
-        return pd.DataFrame(columns=["timestamp_utc", value_column])
+    if df.empty:
+        return df
 
-    df = pd.DataFrame(raw_series, columns=["epoch_ms", value_column])
-    # Coerce values to numeric; replace None with NaN
-    df[value_column] = pd.to_numeric(df[value_column], errors="coerce")
-    df = df.dropna(subset=["epoch_ms"])
+    cleaned = df.copy()
 
-    # Convert epoch milliseconds to UTC datetime
-    df["timestamp_utc"] = pd.to_datetime(df["epoch_ms"], unit="ms", utc=True)
-    df = df.drop(columns=["epoch_ms"])
-    # Drop exact duplicate timestamps, keeping first
-    df = df.drop_duplicates(subset=["timestamp_utc"]).sort_values("timestamp_utc")
-    return df
+    # Deduplicate by timestamp_utc, keeping latest observation
+    cleaned = cleaned.drop_duplicates(subset=["timestamp_utc"], keep="last")
+
+    # Validate price boundaries (log/clamp or set to NaN if corrupted)
+    if "price_eur_mwh" in cleaned.columns:
+        invalid_mask = (cleaned["price_eur_mwh"] < MIN_PRICE_EUR_MWH) | (
+            cleaned["price_eur_mwh"] > MAX_PRICE_EUR_MWH
+        )
+        cleaned.loc[invalid_mask, "price_eur_mwh"] = np.nan
+
+    # Calculate price in ct/kWh (1 EUR/MWh = 0.1 ct/kWh)
+    if "price_eur_mwh" in cleaned.columns:
+        cleaned["price_ct_kwh"] = cleaned["price_eur_mwh"].apply(
+            lambda v: round(v * 0.1, 4) if pd.notnull(v) else np.nan
+        )
+
+    # Physical generation and load must be non-negative
+    for col in ["solar_mwh", "wind_onshore_mwh", "wind_offshore_mwh", "wind_total_mwh", "load_mwh", "total_generation_mwh"]:
+        if col in cleaned.columns:
+            cleaned[col] = cleaned[col].apply(
+                lambda v: max(0.0, float(v)) if pd.notnull(v) and not np.isnan(v) else np.nan
+            )
+
+    # Compute wind total if components exist
+    if "wind_onshore_mwh" in cleaned.columns and "wind_offshore_mwh" in cleaned.columns:
+        cleaned["wind_total_mwh"] = cleaned.apply(
+            lambda r: (
+                (r["wind_onshore_mwh"] or 0.0) + (r["wind_offshore_mwh"] or 0.0)
+                if pd.notnull(r["wind_onshore_mwh"]) or pd.notnull(r["wind_offshore_mwh"])
+                else np.nan
+            ),
+            axis=1,
+        )
+
+    # Sort strictly by timestamp
+    cleaned = cleaned.sort_values("timestamp_utc").reset_index(drop=True)
+    return cleaned
 
 
-def handle_dst_and_timezones(df: pd.DataFrame) -> pd.DataFrame:
+def add_berlin_timestamps(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensures continuous UTC hourly grid and generates ISO 8601 strings with Berlin offset.
-    Properly handles 23-hour days (Spring DST transition) and 25-hour days (Fall DST transition)
-    without dropping hours or creating index ambiguity.
+    Adds timestamp_berlin column in ISO 8601 format with explicit timezone offset
+    (e.g., 2026-10-25T02:00:00+02:00 vs 2026-10-25T02:00:00+01:00).
+    Properly handles 23-hour and 25-hour DST transition days.
     """
     if df.empty or "timestamp_utc" not in df.columns:
         return df
 
-    df = df.copy()
-    if not pd.api.types.is_datetime64_any_dtype(df["timestamp_utc"]):
-        df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
+    result = df.copy()
+    berlin_times = []
 
-    df = df.sort_values("timestamp_utc").drop_duplicates(subset=["timestamp_utc"])
-    df = df.set_index("timestamp_utc")
+    for ts_str in result["timestamp_utc"]:
+        # Parse UTC string (handling both 'Z' and offset format)
+        if isinstance(ts_str, str):
+            dt_utc = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        elif isinstance(ts_str, pd.Timestamp):
+            dt_utc = ts_str.to_pydatetime()
+            if dt_utc.tzinfo is None:
+                dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        else:
+            berlin_times.append("")
+            continue
 
-    # Reindex to an unbroken hourly frequency in UTC
-    full_idx = pd.date_range(
-        start=df.index.min(),
-        end=df.index.max(),
-        freq="1h",
-        tz="UTC",
-        name="timestamp_utc"
-    )
-    df = df.reindex(full_idx)
+        dt_berlin = dt_utc.astimezone(BERLIN_TZ)
+        berlin_times.append(dt_berlin.isoformat())
 
-    # Convert UTC to Europe/Berlin timezone
-    berlin_tz = df.index.tz_convert("Europe/Berlin")
-    # Store formatted ISO-8601 strings with explicit offset (e.g. +01:00 or +02:00)
-    df["timestamp_cet"] = berlin_tz.strftime("%Y-%m-%d %H:%M:%S%z")
-    df["timestamp_cet_iso"] = berlin_tz.isoformat()
-    df = df.reset_index()
-    # Format UTC as string
-    df["timestamp_utc"] = df["timestamp_utc"].dt.strftime("%Y-%m-%d %H:%M:%SZ")
-
-    return df
+    result["timestamp_berlin"] = berlin_times
+    return result
 
 
-def impute_missing_values(df: pd.DataFrame, numeric_cols: List[str]) -> pd.DataFrame:
+def detect_dst_transition_day(date_str: str) -> Tuple[bool, int]:
     """
-    Handles missing values in time-series data:
-    - Linear interpolation for isolated gaps (up to 3 consecutive hours)
-    - Forward-fill followed by backward-fill for remaining edge cases
+    Checks if a given calendar date (YYYY-MM-DD) in Germany is a DST transition day.
+    Returns (is_transition_day, hours_in_day):
+    - Normal day: (False, 24)
+    - Spring forward day (March): (True, 23)
+    - Fall back day (October): (True, 25)
     """
-    df = df.copy()
-    for col in numeric_cols:
-        if col in df.columns:
-            # Interpolate short gaps linearly
-            df[col] = df[col].interpolate(method="linear", limit=3)
-            # Fill remaining with ffill and bfill
-            df[col] = df[col].ffill().bfill()
-    return df
+    try:
+        # Construct midnight at start and midnight at end in Berlin local time
+        start_berlin = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=BERLIN_TZ)
+        next_day = start_berlin.date() + pd.Timedelta(days=1)
+        end_berlin = datetime(next_day.year, next_day.month, next_day.day, tzinfo=BERLIN_TZ)
+        hours = int((end_berlin.astimezone(timezone.utc) - start_berlin.astimezone(timezone.utc)).total_seconds() / 3600)
+        return (hours != 24, hours)
+    except Exception:
+        return (False, 24)
 
 
-def harmonize_market_data(
-    price_df: pd.DataFrame,
-    load_df: Optional[pd.DataFrame] = None,
-    solar_df: Optional[pd.DataFrame] = None,
-    wind_onshore_df: Optional[pd.DataFrame] = None,
-    wind_offshore_df: Optional[pd.DataFrame] = None,
-    residual_df: Optional[pd.DataFrame] = None
+def build_continuous_hourly_grid(
+    df: pd.DataFrame,
+    start_utc: Optional[str] = None,
+    end_utc: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Combines all distinct SMARD streams into a single cleaned, aligned DataFrame.
-    Performs unit conversions (EUR/MWh -> ct/kWh) and computes renewable totals.
+    Constructs a regular, unbroken UTC hourly index between start and end.
+    Missing intervals have NaN for prices and load without silently fabricating data.
     """
-    if price_df.empty:
-        raise ValueError("Price dataframe cannot be empty")
+    if df.empty:
+        return df
 
-    merged = price_df.copy()
+    data = df.copy()
+    data["dt_utc"] = pd.to_datetime(data["timestamp_utc"], utc=True)
+    data = data.sort_values("dt_utc").drop_duplicates(subset=["dt_utc"]).set_index("dt_utc")
 
-    # Merge each auxiliary stream on timestamp_utc
-    aux_frames = [
-        ("load_df", load_df, "grid_load_mw"),
-        ("solar_df", solar_df, "solar_mw"),
-        ("wind_onshore_df", wind_onshore_df, "wind_onshore_mw"),
-        ("wind_offshore_df", wind_offshore_df, "wind_offshore_mw"),
-        ("residual_df", residual_df, "residual_load_mw")
-    ]
+    min_ts = pd.to_datetime(start_utc, utc=True) if start_utc else data.index.min()
+    max_ts = pd.to_datetime(end_utc, utc=True) if end_utc else data.index.max()
 
-    for name, f, col_name in aux_frames:
-        if f is not None and not f.empty:
-            merged = pd.merge(merged, f[["timestamp_utc", col_name]], on="timestamp_utc", how="left")
-        else:
-            merged[col_name] = np.nan
+    full_grid = pd.date_range(start=min_ts, end=max_ts, freq="1h", tz="UTC", name="dt_utc")
+    reindexed = data.reindex(full_grid)
 
-    # Clean and regularize timegrid
-    merged = handle_dst_and_timezones(merged)
+    reindexed["timestamp_utc"] = [dt.strftime("%Y-%m-%dT%H:%M:%SZ") for dt in reindexed.index]
+    reindexed = reindexed.reset_index(drop=True)
+    reindexed = add_berlin_timestamps(reindexed)
 
-    # Numerical imputation
-    data_cols = [
-        "price_eur_mwh", "grid_load_mw", "solar_mw",
-        "wind_onshore_mw", "wind_offshore_mw", "residual_load_mw"
-    ]
-    merged = impute_missing_values(merged, data_cols)
+    return reindexed
 
-    # Calculate derivative columns
-    merged["price_ct_kwh"] = (merged["price_eur_mwh"] * 0.1).round(4)
 
-    merged["wind_onshore_mw"] = merged["wind_onshore_mw"].fillna(0.0).clip(lower=0.0)
-    merged["wind_offshore_mw"] = merged["wind_offshore_mw"].fillna(0.0).clip(lower=0.0)
-    merged["wind_total_mw"] = merged["wind_onshore_mw"] + merged["wind_offshore_mw"]
-    merged["solar_mw"] = merged["solar_mw"].fillna(0.0).clip(lower=0.0)
+def calculate_data_quality_metrics(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Calculates transparency metrics on coverage, missing data, and date range.
+    """
+    if df.empty:
+        return {
+            "total_observations": 0,
+            "missing_prices_count": 0,
+            "missing_prices_pct": 100.0,
+            "min_date_utc": None,
+            "max_date_utc": None,
+        }
 
-    # Fill grid load if still missing based on residual load or standard profile
-    if merged["grid_load_mw"].isna().any():
-        mean_load = merged["grid_load_mw"].mean()
-        if np.isnan(mean_load):
-            mean_load = 55000.0  # German average grid load ~55 GW
-        merged["grid_load_mw"] = merged["grid_load_mw"].fillna(mean_load)
+    total = len(df)
+    missing_prices = df["price_ct_kwh"].isna().sum() if "price_ct_kwh" in df.columns else total
+    missing_pct = round((missing_prices / total) * 100.0, 2) if total > 0 else 100.0
 
-    # Compute residual load: Load - (Wind + Solar)
-    calc_residual = merged["grid_load_mw"] - (merged["wind_total_mw"] + merged["solar_mw"])
-    merged["residual_load_mw"] = merged["residual_load_mw"].fillna(calc_residual)
-
-    return merged
+    return {
+        "total_observations": total,
+        "missing_prices_count": int(missing_prices),
+        "missing_prices_pct": missing_pct,
+        "min_date_utc": df["timestamp_utc"].min() if "timestamp_utc" in df.columns else None,
+        "max_date_utc": df["timestamp_utc"].max() if "timestamp_utc" in df.columns else None,
+    }
