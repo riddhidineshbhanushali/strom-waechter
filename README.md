@@ -3,11 +3,15 @@
 > **Wisse, wann Strom günstig ist. Smarte Energieentscheidungen für dein Zuhause.**  
 > *Know when electricity is cheap. Make smarter energy decisions.*
 
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://strom-waechter.streamlit.app)
 [![Test Suite](https://github.com/riddhidineshbhanushali/strom-waechter/actions/workflows/update.yml/badge.svg)](https://github.com/riddhidineshbhanushali/strom-waechter/actions)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.35+-FF4B4B.svg)](https://streamlit.io/)
 [![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57.svg)](https://www.sqlite.org/)
+
+> 🚀 **Live Interactive Dashboard:** [**strom-waechter.streamlit.app**](https://strom-waechter.streamlit.app)  
+> *Click the link above to test the live app directly in your browser without installing anything!*
 
 ---
 
