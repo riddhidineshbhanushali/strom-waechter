@@ -290,6 +290,9 @@ def generate_upcoming_forecasts(
     start_future_dt = last_published_dt + timedelta(hours=1)
     future_dts = [start_future_dt + timedelta(hours=h) for h in range(horizon_hours)]
 
+    # Fallback default price (dataset historical mean or 10.0 ct/kWh)
+    default_price = float(clean_df["price_ct_kwh"].dropna().mean()) if not clean_df["price_ct_kwh"].dropna().empty else 10.0
+
     for f_dt in future_dts:
         iso_utc = f_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         dt_berlin = f_dt.astimezone(pd.to_datetime("now", utc=True).tz)
@@ -297,14 +300,17 @@ def generate_upcoming_forecasts(
 
         # Find historical reference (same hour last week, t - 168h)
         ref_dt = f_dt - timedelta(days=7)
-        ref_row = clean_df[clean_df["dt_utc"] == ref_dt]
-        if not ref_row.empty and pd.notnull(ref_row.iloc[0]["price_ct_kwh"]):
+        ref_row = clean_df[(clean_df["dt_utc"] == ref_dt) & (clean_df["price_ct_kwh"].notnull())]
+        if not ref_row.empty:
             pred_val = float(ref_row.iloc[0]["price_ct_kwh"])
         else:
             # Fallback to 24h prior
             ref_dt24 = f_dt - timedelta(days=1)
-            ref_row24 = clean_df[clean_df["dt_utc"] == ref_dt24]
-            pred_val = float(ref_row24.iloc[0]["price_ct_kwh"]) if not ref_row24.empty else 10.0
+            ref_row24 = clean_df[(clean_df["dt_utc"] == ref_dt24) & (clean_df["price_ct_kwh"].notnull())]
+            pred_val = float(ref_row24.iloc[0]["price_ct_kwh"]) if not ref_row24.empty else default_price
+
+        if pd.isna(pred_val) or np.isnan(pred_val):
+            pred_val = default_price
 
         # Confidence interval: 80% uncertainty interval (~1.28 * RMSE)
         margin = max(1.5, 1.28 * best_rmse)

@@ -242,6 +242,9 @@ def save_forecasts(df: pd.DataFrame, db_path: Optional[Path] = None) -> int:
     try:
         with conn:
             for _, row in df.iterrows():
+                p_val = row["predicted_price_ct_kwh"]
+                if pd.isna(p_val):
+                    continue
                 conn.execute("""
                 INSERT OR REPLACE INTO forecasts (
                     forecast_issue_time_utc, target_time_utc, target_time_berlin,
