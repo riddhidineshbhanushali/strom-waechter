@@ -17,6 +17,22 @@ from translations import get_text
 # Initialize Database on startup
 init_db()
 
+# Auto-sync market data if older than 20 hours (runs seamlessly in the cloud)
+@st.cache_resource(ttl=3600)
+def check_and_auto_sync():
+    try:
+        latest = get_latest_market_timestamp()
+        if latest:
+            dt_latest = datetime.fromisoformat(latest.replace("Z", "+00:00"))
+            age_hours = (datetime.now(timezone.utc) - dt_latest).total_seconds() / 3600.0
+            if age_hours > 20.0:
+                from pipeline import run_pipeline
+                run_pipeline(max_weeks=2, incremental=True)
+    except Exception:
+        pass
+
+check_and_auto_sync()
+
 # Streamlit Page Configuration
 st.set_page_config(
     page_title="Strom-Wächter | German Energy Analytics",
